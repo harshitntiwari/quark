@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,9 +37,7 @@ type Store interface {
 	Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error)
 	Claim(ctx context.Context, p ClaimParams) ([]Job, error)
 	Complete(ctx context.Context, jobID int64, workerID string) error
+	Snooze(ctx context.Context, jobID int64, workerID string, nextRunAt time.Time) error
 	Retry(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError, nextRunAt time.Time) error
 	DeadLetter(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError) error
 }
-
-var ErrDuplicateJob = errors.New("job already exists for this unique_key")
-var ErrLeaseLost = errors.New("lease lost by worker")

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// DBStore implements [Store]
 type DBStore struct {
 	pool *pgxpool.Pool
 }
@@ -118,7 +119,25 @@ func (db *DBStore) Complete(ctx context.Context, jobID int64, workerID string) e
 	return nil
 }
 
-// moves a task from 'running' state to 'available' state
+// moves a task from 'running' state to 'available' state without consuming an attempt or logging any error
+func (db *DBStore) Snooze(ctx context.Context, jobID int64, workerID string, nextRunAt time.Time) error {
+	const query = `
+		UPDATE jobs SET state = 'available', run_at = $3, attempts = GREATEST(0, attempts - 1), locked_by = null, locked_until = null
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, nextRunAt)
+	if err != nil {
+		return err
+	}
+
+	// if 0 rows were affected, it means the worker lost lease of this job
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// moves a task from 'running' state to 'available' state, consumes an attempt and logs the error
 func (db *DBStore) Retry(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError, nextRunAt time.Time) error {
 	const query = `
 		UPDATE jobs SET state = 'available', run_at = $3, errors = errors || $4::jsonb, locked_by = null, locked_until = null
