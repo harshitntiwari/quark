@@ -40,4 +40,7 @@ type Store interface {
 	Snooze(ctx context.Context, jobID int64, workerID string, nextRunAt time.Time) error
 	Retry(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError, nextRunAt time.Time) error
 	DeadLetter(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError) error
+	Heartbeat(ctx context.Context, jobID int64, workerID string, leaseDuration time.Duration) error
+	ReapExpiredLeases(ctx context.Context) (int64, error)
+	DeleteCompletedJobs(ctx context.Context, olderThan time.Time) (int64, error)
 }
