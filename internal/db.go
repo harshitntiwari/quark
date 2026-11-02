@@ -62,7 +62,15 @@ func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, er
 		}
 		return Job{}, err
 	}
-	return j, err
+
+	// Notify any listening workers that a new job is available in this queue
+	// by publishing a notification on a channel
+	_, err = dt.Exec(ctx, "SELECT pg_notify('quark_available', $1)", j.Queue)
+	if err != nil {
+		return Job{}, err
+	}
+
+	return j, nil
 }
 
 // moves a fixed number of jobs from 'available' state to 'running' state and returns them
