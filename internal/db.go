@@ -180,3 +180,60 @@ func (db *DBStore) DeadLetter(ctx context.Context, jobID int64, workerID string,
 	}
 	return nil
 }
+
+// increases the locked_until of a job by leaseDuration ms
+func (db *DBStore) Heartbeat(ctx context.Context, jobID int64, workerID string, leaseDuration time.Duration) error {
+	const query = `
+		UPDATE jobs SET locked_until = NOW() + ($3 * INTERVAL '1 millisecond')
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, leaseDuration.Milliseconds())
+	if err != nil {
+		return err
+	}
+
+	// if 0 rows were affected, it means the worker lost lease of this job
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// updates state of jobs in 'running' state whose lease has been lost by their workers
+func (db *DBStore) ReapExpiredLeases(ctx context.Context) (int64, error) {
+	const query = `
+	UPDATE jobs
+	SET state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'available' END,
+		finished_at = CASE WHEN attempts >= max_attempts THEN NOW() ELSE finished_at END,
+		locked_by = NULL,
+		locked_until = NULL,
+		errors = errors || jsonb_build_array(jsonb_build_object(
+			'attempt', attempts,
+			'error', 'worker lease expired',
+			'failed_at', NOW()
+    	))
+	WHERE locked_until < NOW() AND state = 'running'
+	`
+
+	tag, err := db.pool.Exec(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// delete jobs which have been completed before a specified time (olderThan)
+func (db *DBStore) DeleteCompletedJobs(ctx context.Context, olderThan time.Time) (int64, error) {
+	const query = `
+		DELETE FROM jobs
+		WHERE state = 'completed' AND finished_at < $1
+	`
+	
+	tag, err := db.pool.Exec(ctx, query, olderThan)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}

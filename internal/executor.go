@@ -12,6 +12,7 @@ type ExecutorConfig struct {
 	WorkerID       string
 	RetryBaseDelay time.Duration
 	RetryMaxDelay  time.Duration
+	LeaseDuration  time.Duration
 }
 
 type HandlerFunc func(ctx context.Context, job Job) error
@@ -60,11 +61,19 @@ func (e *Executor) runJob(ctx context.Context, job Job) {
 	}
 
 	// create a new context with job's timeout
-	jobCtx, cancel := context.WithTimeout(ctx, job.Timeout)
-	defer cancel()
+	jobCtx, cancelJob := context.WithTimeout(ctx, job.Timeout)
+	defer cancelJob()
+
+	heartbeatCtx, stopHearbeat := context.WithCancel(ctx)
+
+	// start heartbeat goroutine to extend lease
+	go e.startHeartbeat(heartbeatCtx, job, cancelJob)
 
 	// execute the job's handler
 	err := e.executeSafe(jobCtx, handler, job)
+
+	// stop heartbeat goroutine
+	stopHearbeat()
 
 	// handle job's state transition based on error returned
 	if err == nil {
@@ -103,6 +112,30 @@ func (e *Executor) executeSafe(ctx context.Context, handler HandlerFunc, job Job
 		}
 	}()
 	return handler(ctx, job)
+}
+
+// extends lease of a job for a worker at fixed intervals
+func (e *Executor) startHeartbeat(ctx context.Context, job Job, cancelJob context.CancelFunc) {
+	interval := e.cfg.LeaseDuration / 3
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := e.store.Heartbeat(ctx, job.ID, e.cfg.WorkerID, e.cfg.LeaseDuration)
+			// if the current worker lost lease of this job, cancel job execution
+			if errors.Is(err, ErrLeaseLost) {
+				cancelJob()
+				return
+			}
+		}
+	}
 }
 
 func (e *Executor) Wait() {
