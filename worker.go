@@ -75,7 +75,7 @@ func NewWorker(pool *pgxpool.Pool, cfg *WorkerConfig) *Worker {
 		RetryMaxDelay:  c.RetryMaxDelay,
 		LeaseDuration:  c.LeaseDuration,
 	})
-	fetcher := internal.NewFetcher(store, executor, internal.FetcherConfig{
+	fetcher := internal.NewFetcher(pool, store, executor, internal.FetcherConfig{
 		Queue:         c.Queue,
 		WorkerID:      c.WorkerID,
 		Concurrency:   c.Concurrency,
