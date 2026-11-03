@@ -6,9 +6,9 @@ import (
 )
 
 type AttemptError struct {
-	Attempt  int
-	Error    string
-	FailedAt time.Time
+	Attempt  int       `json:"attempt"`
+	Error    string    `json:"error"`
+	FailedAt time.Time `json:"failed_at"`
 }
 
 type Job struct {

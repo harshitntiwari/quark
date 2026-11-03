@@ -37,10 +37,10 @@ func NewClient(pool *pgxpool.Pool, cfg *ClientConfig) (*Client, error) {
 	if cfg != nil {
 		c = *cfg
 		if c.DefaultMaxAttempts < 0 {
-			return &Client{}, fmt.Errorf("default max attempts must be positive")
+			return nil, fmt.Errorf("default max attempts must be positive")
 		}
 		if c.DefaultTimeout < 0 {
-			return &Client{}, fmt.Errorf("default timeout must be positive")
+			return nil, fmt.Errorf("default timeout must be positive")
 		}
 	}
 	return &Client{
@@ -64,6 +64,11 @@ type EnqueueOpts struct {
 	UniqueKey   string
 }
 
+type BatchItem struct {
+	Args JobArgs
+	Opts *EnqueueOpts
+}
+
 func (c *Client) Enqueue(ctx context.Context, args JobArgs, opts *EnqueueOpts) (Job, error) {
 	return c.enqueue(ctx, c.pool, args, opts)
 }
@@ -75,18 +80,51 @@ func (c *Client) EnqueueTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *E
 	return c.enqueue(ctx, tx, args, opts)
 }
 
+func (c *Client) EnqueueBatch(ctx context.Context, items []BatchItem) ([]Job, error) {
+	return c.enqueueBatch(ctx, c.pool, items)
+}
+
+func (c *Client) EnqueueBatchTx(ctx context.Context, tx pgx.Tx, items []BatchItem) ([]Job, error) {
+		if tx == nil {
+		return nil, fmt.Errorf("missing database transaction")
+	}
+	return c.enqueueBatch(ctx, tx, items) 
+}
+
 func (c *Client) enqueue(ctx context.Context, dt internal.DBTX, args JobArgs, opts *EnqueueOpts) (Job, error) {
 
+	p, err := c.validateArgsAndOpts(args, opts)
+	if err != nil {
+		return Job{}, err
+	}
+
+	return c.store.Insert(ctx, dt, p)
+}
+
+func (c *Client) enqueueBatch(ctx context.Context, dt internal.DBTX, items []BatchItem)([]Job, error) {
+	var params = make([]internal.InsertParams, 0, len(items))
+	for _, i := range items {
+		p, err := c.validateArgsAndOpts(i.Args, i.Opts)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, p)
+	}
+
+	return c.store.InsertBatch(ctx, dt, params)
+}
+
+func (c *Client) validateArgsAndOpts(args JobArgs, opts *EnqueueOpts) (internal.InsertParams, error) {
 	// validate args
 	if args == nil {
-		return Job{}, fmt.Errorf("missing job args")
+		return internal.InsertParams{}, fmt.Errorf("missing job args")
 	}
 	if args.Kind() == "" {
-		return Job{}, fmt.Errorf("missing Kind in job args")
+		return internal.InsertParams{}, fmt.Errorf("missing Kind in job args")
 	}
 	a, err := json.Marshal(args)
 	if err != nil {
-		return Job{}, err
+		return internal.InsertParams{}, err
 	}
 
 	// build InsertParams with defaults
@@ -103,19 +141,19 @@ func (c *Client) enqueue(ctx context.Context, dt internal.DBTX, args JobArgs, op
 	if opts != nil {
 		// validate opts
 		if opts.Priority < 0 {
-			return Job{}, fmt.Errorf("priority must be a non-negative integer")
+			return internal.InsertParams{}, fmt.Errorf("priority must be a non-negative integer")
 		}
 		if opts.MaxAttempts < 0 {
-			return Job{}, fmt.Errorf("max attempts must be a positive integer")
+			return internal.InsertParams{}, fmt.Errorf("max attempts must be a positive integer")
 		}
 		if opts.Timeout < 0 {
-			return Job{}, fmt.Errorf("timeout must be positive")
+			return internal.InsertParams{}, fmt.Errorf("timeout must be positive")
 		}
 		if opts.Delay < 0 {
-			return Job{}, fmt.Errorf("delay must be non-negative")
+			return internal.InsertParams{}, fmt.Errorf("delay must be non-negative")
 		}
 		if !opts.RunAt.IsZero() && opts.Delay > 0 {
-			return Job{}, fmt.Errorf("conflicting scheduling options configured: RunAt and Delay")
+			return internal.InsertParams{}, fmt.Errorf("conflicting scheduling options configured: RunAt and Delay")
 		}
 
 		// override opts
@@ -132,6 +170,5 @@ func (c *Client) enqueue(ctx context.Context, dt internal.DBTX, args JobArgs, op
 			p.UniqueKey = &opts.UniqueKey
 		}
 	}
-
-	return c.store.Insert(ctx, dt, p)
+	return p, nil
 }
