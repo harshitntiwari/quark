@@ -1,6 +1,6 @@
-# Quark
+# <p align="center">Quark</p>
 
-Quark is a lightweight, reliable and distributed PostgreSQL-backed background job queue for Go built on `pgx/v5`.
+<p align="center"> A lightweight, reliable and distributed PostgreSQL-backed background job queue for Go built on `pgx/v5`.</p>
 
 ![Alt text](docs/images/arch.svg)
 
