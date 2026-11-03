@@ -13,6 +13,7 @@ type DBTX interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 type InsertParams struct {
@@ -35,6 +36,7 @@ type ClaimParams struct {
 
 type Store interface {
 	Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error)
+	InsertBatch(ctx context.Context, dt DBTX, p []InsertParams) ([]Job, error)
 	Claim(ctx context.Context, p ClaimParams) ([]Job, error)
 	Complete(ctx context.Context, jobID int64, workerID string) error
 	Snooze(ctx context.Context, jobID int64, workerID string, nextRunAt time.Time) error

@@ -40,9 +40,7 @@ func scanJob(row pgx.Row) (Job, error) {
 	return j, nil
 }
 
-// inserts a new job into `jobs` table within the caller's db transaction
-func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error) {
-	const query = `
+const insertJobQuery = `
 		INSERT INTO jobs (queue, kind, args, unique_key, priority, max_attempts, run_at, timeout_ms) values ($1, $2, $3, $4, $5, $6, $7, $8) 
 		ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL AND state IN ('available', 'running')
 		DO NOTHING 
@@ -51,7 +49,10 @@ func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, er
 			state, run_at, timeout_ms, locked_by, locked_until, errors, created_at, finished_at
 	`
 
-	row := dt.QueryRow(ctx, query, p.Queue, p.Kind, p.Args, p.UniqueKey, p.Priority, p.MaxAttempts, p.RunAt, p.Timeout.Milliseconds())
+// inserts a new job into `jobs` table within the caller's db transaction
+func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error) {
+
+	row := dt.QueryRow(ctx, insertJobQuery, p.Queue, p.Kind, p.Args, p.UniqueKey, p.Priority, p.MaxAttempts, p.RunAt, p.Timeout.Milliseconds())
 
 	j, err := scanJob(row)
 
@@ -71,6 +72,57 @@ func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, er
 	}
 
 	return j, nil
+}
+
+func (db *DBStore) InsertBatch(ctx context.Context, dt DBTX, params []InsertParams) ([]Job, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+
+	// track unique queue names
+	queues := make(map[string]struct{})
+
+	batch := &pgx.Batch{}
+
+	// for each param, queue a new query to the batch
+	for _, p := range params {
+		batch.Queue(insertJobQuery, p.Queue, p.Kind, p.Args, p.UniqueKey, p.Priority, p.MaxAttempts, p.RunAt, p.Timeout.Milliseconds())
+		queues[p.Queue] = struct{}{}
+	}
+
+	// for each unique queue, add a notify query to the batch queue
+	for q := range queues {
+		batch.Queue("SELECT pg_notify('quark_available', $1)", q)
+	}
+
+	// in the batch.Qeueue: first len(params) number of queries are for inserts
+	// and next len(queues) number of queries are for notify
+
+	br := dt.SendBatch(ctx, batch)
+	defer br.Close()
+
+	// run QueryRow() on first len(params) number of queries to collect the jobs
+	jobs := make([]Job, 0, len(params))
+	for range params {
+		j, err := scanJob(br.QueryRow())
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrDuplicateJob
+			}
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+
+	// run Exec() for remaining len(queues) number of queries to execute notify
+	for range queues {
+		_, err := br.Exec()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return jobs, nil
 }
 
 // moves a fixed number of jobs from 'available' state to 'running' state and returns them
@@ -237,7 +289,7 @@ func (db *DBStore) DeleteCompletedJobs(ctx context.Context, olderThan time.Time)
 		DELETE FROM jobs
 		WHERE state = 'completed' AND finished_at < $1
 	`
-	
+
 	tag, err := db.pool.Exec(ctx, query, olderThan)
 	if err != nil {
 		return 0, err
