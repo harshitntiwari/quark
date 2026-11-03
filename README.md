@@ -2,6 +2,8 @@
 
 Quark is a lightweight, reliable and distributed PostgreSQL-backed background job queue for Go built on `pgx/v5`.
 
+![Alt text](docs/images/arch.svg)
+
 ## Features
 
 - **Transactional Enqueuing:** Enqueue jobs inside your existing database transactions (`EnqueueTx`, `EnqueueBatchTx`) so jobs only exist if your business transaction commits.
