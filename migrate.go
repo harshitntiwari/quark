@@ -57,6 +57,7 @@ func runMigrations(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
+// Migrate applies all embedded SQL schema migrations to the database idempotently.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		// ACQUIRE transaction level lock
