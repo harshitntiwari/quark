@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// package defaults for job-related configs
 const (
 	defaultQueue       = "default"
 	defaultPriority    = 0
@@ -19,9 +20,19 @@ const (
 	defaultTimeout     = 60 * time.Second
 )
 
+// ClientConfig configures default job parameters for a [Client].
+// Zero values fall back to package defaults.
 type ClientConfig struct {
+	// DefaultQueue is the queue name used when EnqueueOpts.Queue is empty.
+	// Defaults to "default".
 	DefaultQueue       string
+
+	// DefaultMaxAttempts is the maximum number of execution attempts before a
+	// failing job is moved to the dead state. Defaults to 3.
 	DefaultMaxAttempts int
+
+	// DefaultTimeout is the maximum duration a single job attempt may run before
+	// its context is cancelled. Defaults to 60s.
 	DefaultTimeout     time.Duration
 }
 
@@ -31,7 +42,7 @@ type Client struct {
 	cfg   ClientConfig
 }
 
-// creates and returns a new quark producer [Client]
+// NewClient creates and returns a new quark producer [Client]
 func NewClient(pool *pgxpool.Pool, cfg *ClientConfig) (*Client, error) {
 	var c ClientConfig
 	if cfg != nil {
@@ -54,13 +65,32 @@ func NewClient(pool *pgxpool.Pool, cfg *ClientConfig) (*Client, error) {
 	}, nil
 }
 
+// EnqueueOpts specifies per-job overrides when enqueuing a job.
+// All fields are optional; zero values fall back to the Client's defaults.
 type EnqueueOpts struct {
+	// Queue overrides the target queue name for this job.
 	Queue       string
+
+	// Priority sets the execution priority (0 is highest priority; higher
+	// numbers run later). Defaults to 0.
 	Priority    int
+
+	// MaxAttempts overrides the maximum number of attempts for this job.
 	MaxAttempts int
+
+	// RunAt schedules the job to become eligible for execution at a specific time.
+	// Cannot be combined with Delay. Defaults to time.Now().
 	RunAt       time.Time
+
+	// Delay schedules the job to run after the given duration has elapsed.
+	// Cannot be combined with RunAt.
 	Delay       time.Duration
+
+	// Timeout overrides the per-attempt execution timeout for this job.
 	Timeout     time.Duration
+
+	// UniqueKey deduplicates active jobs. If a job with the same UniqueKey is
+	// currently in the 'available' or 'running' state, Enqueue returns ErrDuplicateJob.
 	UniqueKey   string
 }
 
@@ -69,10 +99,12 @@ type BatchItem struct {
 	Opts *EnqueueOpts
 }
 
+// Enqueue inserts a new job into the queue using the client's connection pool.
 func (c *Client) Enqueue(ctx context.Context, args JobArgs, opts *EnqueueOpts) (Job, error) {
 	return c.enqueue(ctx, c.pool, args, opts)
 }
 
+// EnqueueTx inserts a new job within the caller's existing database transaction.
 func (c *Client) EnqueueTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *EnqueueOpts) (Job, error) {
 	if tx == nil {
 		return Job{}, fmt.Errorf("missing database transaction")
@@ -80,10 +112,12 @@ func (c *Client) EnqueueTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *E
 	return c.enqueue(ctx, tx, args, opts)
 }
 
+// EnqueueBatch inserts multiple jobs in a single network round-trip using the client's connection pool.
 func (c *Client) EnqueueBatch(ctx context.Context, items []BatchItem) ([]Job, error) {
 	return c.enqueueBatch(ctx, c.pool, items)
 }
 
+// EnqueueBatchTx inserts multiple jobs in a single batch within the caller's existing database transaction.
 func (c *Client) EnqueueBatchTx(ctx context.Context, tx pgx.Tx, items []BatchItem) ([]Job, error) {
 		if tx == nil {
 		return nil, fmt.Errorf("missing database transaction")
