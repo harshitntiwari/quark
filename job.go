@@ -37,3 +37,12 @@ func NonRetryable(err error) error {
 func Snooze(d time.Duration) error {
     return &SnoozeError{Duration: d}
 }
+
+type Schedule = internal.Schedule
+type MisfirePolicy = internal.MisfirePolicy
+
+const (
+    MisfireSkip    MisfirePolicy = internal.MisfireSkip
+    MisfireRunOnce MisfirePolicy = internal.MisfireRunOnce
+    MisfireCatchUp MisfirePolicy = internal.MisfireCatchUp
+)

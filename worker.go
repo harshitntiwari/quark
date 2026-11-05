@@ -15,13 +15,15 @@ import (
 
 // package defaults for worker config
 const (
-	defaultConcurrency     = 10
-	defaultPollInterval    = 500 * time.Millisecond
-	defaultLeaseDuration   = 30 * time.Second
-	defaultRetryBaseDelay  = 1 * time.Second
-	defaultRetryMaxDelay   = 5 * time.Minute
-	defaultReapInterval    = 10 * time.Second
-	defaultRetentionPeriod = 24 * time.Hour
+	defaultConcurrency       = 10
+	defaultPollInterval      = 500 * time.Millisecond
+	defaultLeaseDuration     = 30 * time.Second
+	defaultRetryBaseDelay    = 1 * time.Second
+	defaultRetryMaxDelay     = 5 * time.Minute
+	defaultReapInterval      = 10 * time.Second
+	defaultRetentionPeriod   = 24 * time.Hour
+	defaultScheduleInterval  = 1 * time.Second
+	defaultScheduleBatchSize = 100
 )
 
 // WorkerConfig configures concurrency, polling, lease, retry, and cleanup
@@ -29,46 +31,55 @@ const (
 type WorkerConfig struct {
 	// Queue is the name of the queue this worker claims jobs from.
 	// Defaults to "default".
-	Queue           string
+	Queue string
 
 	// WorkerID uniquely identifies this worker instance as a lease holder.
 	// Defaults to a randomly generated ID ("worker-<hex>").
-	WorkerID        string
+	WorkerID string
 
 	// Concurrency is the maximum number of jobs this worker may execute in parallel.
 	// Defaults to 10.
-	Concurrency     int
+	Concurrency int
 
 	// PollInterval is how often the worker polls the database for available jobs
 	// as a fallback to LISTEN/NOTIFY wake-ups. Defaults to 500ms.
-	PollInterval    time.Duration
+	PollInterval time.Duration
 
 	// LeaseDuration is how long a claimed job lock is held before expiring if not
 	// renewed by background heartbeats. Defaults to 30s.
-	LeaseDuration   time.Duration
+	LeaseDuration time.Duration
 
 	// RetryBaseDelay is the initial backoff duration before the first retry of a
 	// failed job. Defaults to 1s.
-	RetryBaseDelay  time.Duration
+	RetryBaseDelay time.Duration
 
 	// RetryMaxDelay caps the exponential backoff duration between retries.
 	// Defaults to 5m.
-	RetryMaxDelay   time.Duration
+	RetryMaxDelay time.Duration
 
 	// ReapInterval is how often the background reaper scans for expired leases
 	// and purges old completed jobs. Defaults to 10s.
-	ReapInterval    time.Duration
+	ReapInterval time.Duration
 
 	// RetentionPeriod is how long completed jobs are kept in the database before
 	// being deleted by the reaper. Defaults to 24h.
 	RetentionPeriod time.Duration
+
+	// ScheduleInterval is how often the scheduler leader checks for due cron
+	// schedules. Defaults to 1s.
+	ScheduleInterval time.Duration
+
+	// ScheduleBatchSize is the maximum number of due cron schedules evaluated
+	// in a single scheduler tick. Defaults to 100.
+	ScheduleBatchSize int
 }
 
 type Worker struct {
-	cfg      WorkerConfig
-	executor *internal.Executor
-	fetcher  *internal.Fetcher
-	reaper   *internal.Reaper
+	cfg       WorkerConfig
+	executor  *internal.Executor
+	fetcher   *internal.Fetcher
+	reaper    *internal.Reaper
+	scheduler *internal.Scheduler
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -97,6 +108,8 @@ func NewWorker(pool *pgxpool.Pool, cfg *WorkerConfig) *Worker {
 	c.RetryMaxDelay = cmp.Or(c.RetryMaxDelay, defaultRetryMaxDelay)
 	c.ReapInterval = cmp.Or(c.ReapInterval, defaultReapInterval)
 	c.RetentionPeriod = cmp.Or(c.RetentionPeriod, defaultRetentionPeriod)
+	c.ScheduleInterval = cmp.Or(c.ScheduleInterval, defaultScheduleInterval)
+	c.ScheduleBatchSize = cmp.Or(c.ScheduleBatchSize, int(defaultScheduleBatchSize))
 	store := internal.NewDBStore(pool)
 	executor := internal.NewExecutor(store, internal.ExecutorConfig{
 		WorkerID:       c.WorkerID,
@@ -115,11 +128,16 @@ func NewWorker(pool *pgxpool.Pool, cfg *WorkerConfig) *Worker {
 		Interval:        c.ReapInterval,
 		RetentionPeriod: c.RetentionPeriod,
 	})
+	scheduler := internal.NewScheduler(pool, store, internal.SchedulerConfig{
+		Interval:  c.ScheduleInterval,
+		BatchSize: c.ScheduleBatchSize,
+	})
 	return &Worker{
-		cfg:      c,
-		executor: executor,
-		fetcher:  fetcher,
-		reaper:   reaper,
+		cfg:       c,
+		executor:  executor,
+		fetcher:   fetcher,
+		reaper:    reaper,
+		scheduler: scheduler,
 	}
 }
 
@@ -148,16 +166,20 @@ func (w *Worker) Start(ctx context.Context) {
 	runCtx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 
-	w.wg.Add(2)
+	w.wg.Add(3)
 	go func() {
 		defer w.wg.Done()
 		w.reaper.Run(runCtx)
 	}()
 
-	
 	go func() {
 		defer w.wg.Done()
 		w.fetcher.Run(runCtx)
+	}()
+
+	go func(){
+		defer w.wg.Done()
+		w.scheduler.Run(runCtx)
 	}()
 }
 
