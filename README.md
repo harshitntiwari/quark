@@ -2,7 +2,7 @@
 
 <p align="center"> A lightweight, reliable and distributed PostgreSQL-backed background job queue for Go built on `pgx/v5`.</p>
 
-![Alt text](docs/images/arch.svg)
+![Alt text](docs/images/arch.svg?v=2)
 
 ## Features
 
