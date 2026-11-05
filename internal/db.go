@@ -40,6 +40,25 @@ func scanJob(row pgx.Row) (Job, error) {
 	return j, nil
 }
 
+// hydrates a raw db row from `schedules` table into a [Schedule] struct
+func scanSchedule(row pgx.Row) (Schedule, error) {
+	var s Schedule
+	var timeoutMS int64
+
+	err := row.Scan(
+		&s.Name, &s.CronExpr, &s.Queue, &s.Kind, &s.Args, &s.Priority, &s.MaxAttempts,
+		&timeoutMS, &s.MisfirePolicy, &s.NextRunAt, &s.LastRunAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt,
+	)
+	if err != nil {
+		return Schedule{}, err
+	}
+
+	// convert timeoutMS (which is in ms) to time.Duration
+	s.Timeout = time.Duration(timeoutMS) * time.Millisecond
+
+	return s, nil
+}
+
 const insertJobQuery = `
 		INSERT INTO jobs (queue, kind, args, unique_key, priority, max_attempts, run_at, timeout_ms) values ($1, $2, $3, $4, $5, $6, $7, $8) 
 		ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL AND state IN ('available', 'running')
@@ -296,4 +315,103 @@ func (db *DBStore) DeleteCompletedJobs(ctx context.Context, olderThan time.Time)
 	}
 
 	return tag.RowsAffected(), nil
+}
+
+// creates a new schedule; updates if already exists with the same name.
+func (db *DBStore) UpsertSchedule(ctx context.Context, dt DBTX, p UpsertScheduleParams) (Schedule, error) {
+	const query = `
+		INSERT INTO schedules (
+    		name, cron_expr, queue, kind, args, priority, max_attempts,
+    		timeout_ms, misfire_policy, next_run_at, enabled
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (name) DO UPDATE SET
+			cron_expr      = EXCLUDED.cron_expr,
+			queue          = EXCLUDED.queue,
+			kind           = EXCLUDED.kind,
+			args           = EXCLUDED.args,
+			priority       = EXCLUDED.priority,
+			max_attempts   = EXCLUDED.max_attempts,
+			timeout_ms     = EXCLUDED.timeout_ms,
+			misfire_policy = EXCLUDED.misfire_policy,
+			next_run_at    = EXCLUDED.next_run_at,
+			enabled        = EXCLUDED.enabled,
+			updated_at     = NOW()
+		RETURNING
+			name, cron_expr, queue, kind, args, priority, max_attempts,
+			timeout_ms, misfire_policy, next_run_at, last_run_at,
+			enabled, created_at, updated_at
+	`
+
+	row := dt.QueryRow(
+		ctx, query, p.Name, p.CronExpr, p.Queue, p.Kind, p.Args, p.Priority,
+		p.MaxAttempts, p.Timeout.Milliseconds(), p.MisfirePolicy, p.NextRunAt, p.Enabled,
+	)
+
+	s, err := scanSchedule(row)
+
+	if err != nil {
+		return Schedule{}, err
+	}
+
+	return s, nil
+}
+
+// fetches enabled schedules due for a time <= now.
+func (db *DBStore) ListDueSchedules(ctx context.Context, now time.Time, limit int) ([]Schedule, error) {
+	const query = `
+		SELECT name, cron_expr, queue, kind, args, priority, max_attempts, timeout_ms, 
+			misfire_policy, next_run_at, last_run_at, enabled, created_at, updated_at
+		FROM schedules
+		WHERE enabled = TRUE AND next_run_at <= $1
+		ORDER BY next_run_at ASC
+		LIMIT $2
+	`
+
+	rows, err := db.pool.Query(ctx, query, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var schedules []Schedule
+	for rows.Next() {
+		s, err := scanSchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		schedules = append(schedules, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return schedules, nil
+}
+
+func (db *DBStore) AdvanceScheduleAndEnqueue(ctx context.Context, name string, lastRunAt, nextRunAt time.Time, jobs []InsertParams) error {
+	const updateQuery = `
+        UPDATE schedules
+        SET last_run_at = $2, next_run_at = $3, updated_at = NOW()
+        WHERE name = $1 AND enabled = TRUE AND next_run_at <= $2
+    `
+
+	// update schedule and insert jobs within a transaction
+	return pgx.BeginFunc(ctx, db.pool, func(tx pgx.Tx) error {
+		// update schedule
+		tag, err := tx.Exec(ctx, updateQuery, name, lastRunAt, nextRunAt)
+		if err != nil {
+        	return err
+    	}
+		if tag.RowsAffected() == 0 {
+			// Schedule was already advanced by another leader or disabled
+			return nil
+    	}
+		
+		// batch insert jobs
+		if len(jobs) > 0 {
+			if _, err := db.InsertBatch(ctx, tx, jobs); err != nil && !errors.Is(err, ErrDuplicateJob){
+				return err
+			}
+		}
+		return nil
+	})
 }

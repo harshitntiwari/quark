@@ -34,6 +34,20 @@ type ClaimParams struct {
 	LeaseDuration time.Duration
 }
 
+type UpsertScheduleParams struct {
+	Name          string
+	CronExpr      string
+	Queue         string
+	Kind          string
+	Args          json.RawMessage
+	Priority      int
+	MaxAttempts   int
+	Timeout       time.Duration
+	MisfirePolicy MisfirePolicy
+	NextRunAt     time.Time
+	Enabled       bool
+}
+
 type Store interface {
 	Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error)
 	InsertBatch(ctx context.Context, dt DBTX, p []InsertParams) ([]Job, error)
@@ -45,4 +59,7 @@ type Store interface {
 	Heartbeat(ctx context.Context, jobID int64, workerID string, leaseDuration time.Duration) error
 	ReapExpiredLeases(ctx context.Context) (int64, error)
 	DeleteCompletedJobs(ctx context.Context, olderThan time.Time) (int64, error)
+	UpsertSchedule(ctx context.Context, dt DBTX, p UpsertScheduleParams) (Schedule, error)
+	ListDueSchedules(ctx context.Context, now time.Time, limit int) ([]Schedule, error)
+	AdvanceScheduleAndEnqueue(ctx context.Context, name string, lastRunAt, nextRunAt time.Time, jobs []InsertParams) error
 }
