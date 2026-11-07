@@ -12,22 +12,22 @@ type AttemptError struct {
 }
 
 type Job struct {
-	ID          int64
-	Queue       string
-	Kind        string
-	Args        json.RawMessage
-	UniqueKey   *string
-	Priority    int
-	Attempts    int
-	MaxAttempts int
-	State       JobState
-	RunAt       time.Time
-	Timeout     time.Duration
-	LockedBy    *string
-	LockedUntil *time.Time
-	Errors      []AttemptError
-	CreatedAt   time.Time
-	FinishedAt  *time.Time
+	ID          int64           `json:"id"`
+	Queue       string          `json:"queue"`
+	Kind        string          `json:"kind"`
+	Args        json.RawMessage `json:"args"`
+	UniqueKey   *string         `json:"unique_key"`
+	Priority    int             `json:"priority"`
+	Attempts    int             `json:"attempts"`
+	MaxAttempts int             `json:"max_attempts"`
+	State       JobState        `json:"state"`
+	RunAt       time.Time       `json:"run_at"`
+	Timeout     time.Duration   `json:"timeout"`
+	LockedBy    *string         `json:"locked_by"`
+	LockedUntil *time.Time      `json:"locked_until"`
+	Errors      []AttemptError  `json:"errors"`
+	CreatedAt   time.Time       `json:"created_at"`
+	FinishedAt  *time.Time      `json:"finished_at"`
 }
 
 type MisfirePolicy string
