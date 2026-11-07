@@ -40,11 +40,18 @@ func (e *Executor) Register(kind string, fn HandlerFunc) {
 
 // spawns a go routine to execute a job and call onDone() when finished
 func (e *Executor) Submit(ctx context.Context, job Job, onDone func()) {
+
+	// create a new ctx which will not cancel when the parent ctx is cancelled.
+	// this is important, because if parent ctx is cancelled while jobs are in-flight, 
+	// they won't be able to complete their execution with a cancelled ctx. Therefore,
+	// use bgCtx instead of ctx
+	bgCtx := context.WithoutCancel(ctx)
+
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		defer onDone()
-		e.runJob(ctx, job)
+		e.runJob(bgCtx, job)
 	}()
 }
 
