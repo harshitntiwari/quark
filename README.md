@@ -11,7 +11,8 @@
 - **Type-Safe Generics:** Define strongly-typed job payloads and register generic handlers (`RegisterHandler[T]`) without manual JSON unmarshaling boilerplate.
 - **Automatic Retries & Custom Error Control:** Exponential backoff with jitter by default, plus `NonRetryable` for immediate dead-lettering and `Snooze` to reschedule without consuming an attempt.
 - **Lease Heartbeats & Crash Recovery:** Running jobs automatically extend their leases via background heartbeats. If a lease is lost, the handler's `context.Context` is cancelled immediately. A background reaper recovers zombie jobs from crashed workers and purges old completed jobs.
-- **Deduplication & Scheduling:** Built-in idempotency via `UniqueKey`, priority ordering (`0` = highest), and delayed execution (`Delay` / `RunAt`).
+- **Deduplication & Delayed Execution:** Built-in idempotency via `UniqueKey`, priority ordering (`0` = highest), and delayed execution (`Delay` / `RunAt`).
+- **Distributed Cron Scheduling:** Register recurring cron jobs (`AddSchedule`, `AddScheduleTx`) backed by PostgreSQL advisory-lock leader election, deterministic slot deduplication, and configurable misfire policies (`MisfireSkip`, `MisfireRunOnce`, `MisfireCatchUp`).
 
 ## Installation
 
@@ -140,6 +141,57 @@ items := []quark.BatchItem{
 jobs, err := client.EnqueueBatch(ctx, items)
 ```
 
+#### Recurring Cron Schedules (`AddSchedule` & `AddScheduleTx`)
+
+Register or update recurring cron schedules idempotently using standard 5-field cron expressions (`minute hour day-of-month month day-of-week`). Across a multi-node cluster, Quark uses PostgreSQL advisory locks (`pg_try_advisory_lock`) to elect a single active scheduler leader and attaches a deterministic `UniqueKey` (`schedule:<name>:<slot_time>`) to every generated job to guarantee at-most-once slot enqueuing.
+
+```go
+// Register a schedule with default options
+sched, err := client.AddSchedule(
+    ctx,
+    "daily_digest_email", // unique schedule name (upserts on conflict)
+    "0 9 * * *",          // every day at 09:00 UTC
+    SendEmailArgs{
+        To:      "team@example.com",
+        Subject: "Daily Digest",
+    },
+    nil,
+)
+
+// Register a schedule with custom overrides and misfire policy
+sched, err = client.AddSchedule(
+    ctx,
+    "hourly_invoice_sync",
+    "0 * * * *", // top of every hour
+    SendEmailArgs{
+        To:      "billing@example.com",
+        Subject: "Hourly Sync Report",
+    },
+    &quark.ScheduleOpts{
+        Queue:         "email_queue",
+        Priority:      1,
+        MaxAttempts:   5,
+        Timeout:       2 * time.Minute,
+        MisfirePolicy: quark.MisfireRunOnce,
+        Disabled:      false,
+    },
+)
+```
+
+You can also register or update a schedule atomically within an existing database transaction using `AddScheduleTx`:
+
+```go
+sched, err := client.AddScheduleTx(ctx, tx, "daily_digest_email", "0 9 * * *", args, nil)
+```
+
+##### Misfire Policies
+
+If all workers are offline during one or more scheduled firing windows, `MisfirePolicy` controls how the scheduler recovers when it comes back online:
+
+- **`quark.MisfireRunOnce`**: Enqueues a single job for the most recent missed slot and advances `next_run_at` to the next future slot.
+- **`quark.MisfireSkip`**: Skips all missed slots without enqueuing any jobs and advances `next_run_at` to the next future slot.
+- **`quark.MisfireCatchUp`**: Enqueues a separate job for every missed slot in chronological order and advances `next_run_at` to the next future slot.
+
 ### Consumer Guide (Running Workers)
 
 ##### Initializing and Starting a Worker
@@ -156,6 +208,8 @@ worker := quark.NewWorker(pool, &quark.WorkerConfig{
     RetryMaxDelay:   5 * time.Minute,
     ReapInterval:    10 * time.Second,
     RetentionPeriod: 24 * time.Hour,
+    ScheduleInterval:  1 * time.Second,
+    ScheduleBatchSize: 100,
 })
 
 // Register a strongly-typed handler using generics
@@ -197,3 +251,62 @@ Inside any handler function, the returned error controls the job's state transit
       return quark.Snooze(30 * time.Second)
   }
   ```
+
+## Development & Testing
+
+### Prerequisites
+
+- **Go:** 1.22 or higher
+- **PostgreSQL:** 14 or higher (or Docker to run a local test container)
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/harshitntiwari/quark.git
+cd quark
+go mod download
+```
+
+### 2. Start a Local PostgreSQL Test Instance
+
+Spin up an isolated PostgreSQL container via Docker:
+
+```bash
+docker run --name quark-postgres -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=quark_test -p 5432:5432 -d postgres:16-alpine
+```
+
+### 3. Run the End-to-End Integration Test Suite
+
+The integration test suite in `quark_test.go` verifies transactional enqueuing, `LISTEN/NOTIFY` wake-ups, batching, concurrency semaphores, retry backoff, `Snooze`, `NonRetryable`, panic recovery, lease heartbeats, expired-lease reaping, and cron scheduling against a live PostgreSQL instance.
+
+By default, tests connect to `postgres://postgres:1234@localhost:5432/quark_test?sslmode=disable`. You can override this by setting `DATABASE_URL`:
+
+```bash
+export DATABASE_URL="postgres://<username>:<password>@localhost:5432/<db_name>?sslmode=disable"
+
+# Run all tests with the Go race detector enabled
+go test -v -race ./...
+```
+
+### 4. Project Structure
+
+```text
+quark/
+├── client.go          # Producer API (Enqueue, EnqueueTx, EnqueueBatch, AddSchedule)
+├── worker.go          # Consumer lifecycle, configuration, and generic handler registration
+├── job.go             # Public domain types, job states, and error wrappers
+├── migrate.go         # Embedded SQL migration runner with advisory locking
+├── quark_test.go      # End-to-end integration test suite
+├── migrations/        # SQL schema definitions (jobs, schedules, indexes)
+└── internal/
+    ├── db.go          # PostgreSQL queries (SKIP LOCKED claiming, heartbeats, batching)
+    ├── store.go       # Storage interface and parameter structs
+    ├── fetcher.go     # Concurrency semaphore, polling loop, and LISTEN/NOTIFY subscriber
+    ├── executor.go    # Job execution pipeline, panic recovery, timeouts, and heartbeating
+    ├── reaper.go      # Expired lease recovery and completed job retention cleanup
+    ├── scheduler.go   # Leader-elected cron evaluation and misfire handling
+    ├── retry.go       # Exponential backoff with equal jitter calculation
+    ├── model.go       # Core domain structs (Job, Schedule, AttemptError)
+    ├── state.go       # JobState constants
+    └── errors.go      # Sentinel and custom error types
+```
