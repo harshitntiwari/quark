@@ -20,6 +20,11 @@ const (
 	Cancelled JobState = internal.Cancelled
 )
 
+var (
+	ErrDuplicateJob = internal.ErrDuplicateJob
+	ErrLeaseLost    = internal.ErrLeaseLost
+)
+
 type Job = internal.Job
 type AttemptError = internal.AttemptError
 

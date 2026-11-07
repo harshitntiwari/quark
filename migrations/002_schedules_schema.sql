@@ -1,4 +1,4 @@
-CREATE TABLE schedules IF NOT EXISTS (
+CREATE TABLE IF NOT EXISTS schedules (
     name           TEXT         PRIMARY KEY,
     cron_expr      TEXT        NOT NULL,
     queue          TEXT        NOT NULL DEFAULT 'default',

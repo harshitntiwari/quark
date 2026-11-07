@@ -1,4 +1,4 @@
-CREATE TABLE jobs (
+CREATE TABLE IF NOT EXISTS jobs (
     id              BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     queue           TEXT        NOT NULL DEFAULT 'default',
     kind            TEXT        NOT NULL,
@@ -17,5 +17,5 @@ CREATE TABLE jobs (
     finished_at     TIMESTAMPTZ
 );
 
-CREATE INDEX idx_claimable_jobs ON jobs (queue, priority, run_at, id) WHERE state = 'available';
-CREATE UNIQUE INDEX idx_jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL AND state IN ('available', 'running');
+CREATE INDEX IF NOT EXISTS idx_claimable_jobs ON jobs (queue, priority, run_at, id) WHERE state = 'available';
+CREATE UNIQUE INDEX IF NOT EXISTS  idx_jobs_unique_key ON jobs (unique_key) WHERE unique_key IS NOT NULL AND state IN ('available', 'running');
