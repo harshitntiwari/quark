@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Test & Race Detector
+    runs-on: ubuntu-latest
+
+    # Spin up a PostgreSQL 16 container for quark_test.go
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quark_test
+        ports:
+          - 5432:5432
+        # Wait until Postgres is healthy and accepting connections before running steps
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # Download repository code onto the runner VM
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install Go
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      # Verify dependencies are clean
+      - name: Download dependencies
+        run: go mod download
+
+      # Run static analysis
+      - name: Run go vet
+        run: go vet ./...
+
+      # Run the end-to-end integration test suite with the Race Detector
+      - name: Run integration tests with race detector
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/quark_test?sslmode=disable
+        run: go test -v -race ./...
