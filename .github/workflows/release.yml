@@ -1,0 +1,68 @@
+name: Release
+
+# Only triggers when a version tag is pushed
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish Go Module & GitHub Release
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: quark_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1. Safety guard: Ensure the tag actually belongs to the main branch
+      - name: Verify tag is on origin/main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Error: Release tag ${GITHUB_REF_NAME} is not on the main branch!"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      # 2. Run tests one final time before publishing
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/quark_test?sslmode=disable
+        run: go test -v -race ./...
+
+      # 3. Automatically create a GitHub Release with auto-generated release notes
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+      # 4. Trigger proxy.golang.org and pkg.go.dev to index the new version immediately
+      - name: Index on Go Module Proxy (pkg.go.dev)
+        run: |
+          curl -sSfL "https://proxy.golang.org/github.com/harshitntiwari/quark/@v/${GITHUB_REF_NAME}.info"
