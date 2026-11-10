@@ -1,5 +1,10 @@
 # <p align="center">Quark</p>
 
+<p align="center">
+  <a href="https://github.com/harshitntiwari/quark/actions/workflows/ci.yml"><img src="https://github.com/harshitntiwari/quark/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
+  <a href="https://pkg.go.dev/github.com/harshitntiwari/quark"><img src="https://pkg.go.dev/badge/github.com/harshitntiwari/quark.svg" alt="Go Reference"></a>
+</p>
+
 <p align="center"> A lightweight, reliable and distributed PostgreSQL-backed background job queue for Go built on `pgx/v5`.</p>
 
 ![Alt text](docs/images/arch.svg?v=2)
