@@ -1,0 +1,417 @@
+package internal
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// DBStore implements [Store]
+type DBStore struct {
+	pool *pgxpool.Pool
+}
+
+// allocates and returns a new [DBStore]
+func NewDBStore(pool *pgxpool.Pool) *DBStore {
+	return &DBStore{pool}
+}
+
+// hydrates a raw db row from `jobs` table into a [Job] struct
+func scanJob(row pgx.Row) (Job, error) {
+	var j Job
+	var timeoutMS int64
+
+	err := row.Scan(
+		&j.ID, &j.Queue, &j.Kind, &j.Args, &j.UniqueKey, &j.Priority,
+		&j.Attempts, &j.MaxAttempts, &j.State, &j.RunAt, &timeoutMS,
+		&j.LockedBy, &j.LockedUntil, &j.Errors, &j.CreatedAt, &j.FinishedAt,
+	)
+	if err != nil {
+		return Job{}, err
+	}
+
+	// convert timeoutMS (which is in ms) to time.Duration
+	j.Timeout = time.Duration(timeoutMS) * time.Millisecond
+
+	return j, nil
+}
+
+// hydrates a raw db row from `schedules` table into a [Schedule] struct
+func scanSchedule(row pgx.Row) (Schedule, error) {
+	var s Schedule
+	var timeoutMS int64
+
+	err := row.Scan(
+		&s.Name, &s.CronExpr, &s.Queue, &s.Kind, &s.Args, &s.Priority, &s.MaxAttempts,
+		&timeoutMS, &s.MisfirePolicy, &s.NextRunAt, &s.LastRunAt, &s.Enabled, &s.CreatedAt, &s.UpdatedAt,
+	)
+	if err != nil {
+		return Schedule{}, err
+	}
+
+	// convert timeoutMS (which is in ms) to time.Duration
+	s.Timeout = time.Duration(timeoutMS) * time.Millisecond
+
+	return s, nil
+}
+
+const insertJobQuery = `
+		INSERT INTO jobs (queue, kind, args, unique_key, priority, max_attempts, run_at, timeout_ms) values ($1, $2, $3, $4, $5, $6, $7, $8) 
+		ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL AND state IN ('available', 'running')
+		DO NOTHING 
+		RETURNING
+			id, queue, kind, args, unique_key, priority, attempts, max_attempts,
+			state, run_at, timeout_ms, locked_by, locked_until, errors, created_at, finished_at
+	`
+
+// inserts a new job into `jobs` table within the caller's db transaction
+func (db *DBStore) Insert(ctx context.Context, dt DBTX, p InsertParams) (Job, error) {
+
+	row := dt.QueryRow(ctx, insertJobQuery, p.Queue, p.Kind, p.Args, p.UniqueKey, p.Priority, p.MaxAttempts, p.RunAt, p.Timeout.Milliseconds())
+
+	j, err := scanJob(row)
+
+	if err != nil {
+		// ON CONFLICT DO NOTHING inserts 0 rows, QueryRow() returns 0 rows and Scan() returns pgx.ErrNoRows
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Job{}, ErrDuplicateJob
+		}
+		return Job{}, err
+	}
+
+	// Notify any listening workers that a new job is available in this queue
+	// by publishing a notification on a channel
+	_, err = dt.Exec(ctx, "SELECT pg_notify('quark_available', $1)", j.Queue)
+	if err != nil {
+		return Job{}, err
+	}
+
+	return j, nil
+}
+
+func (db *DBStore) InsertBatch(ctx context.Context, dt DBTX, params []InsertParams) ([]Job, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+
+	// track unique queue names
+	queues := make(map[string]struct{})
+
+	batch := &pgx.Batch{}
+
+	// for each param, queue a new query to the batch
+	for _, p := range params {
+		batch.Queue(insertJobQuery, p.Queue, p.Kind, p.Args, p.UniqueKey, p.Priority, p.MaxAttempts, p.RunAt, p.Timeout.Milliseconds())
+		queues[p.Queue] = struct{}{}
+	}
+
+	// for each unique queue, add a notify query to the batch queue
+	for q := range queues {
+		batch.Queue("SELECT pg_notify('quark_available', $1)", q)
+	}
+
+	// in the batch.Qeueue: first len(params) number of queries are for inserts
+	// and next len(queues) number of queries are for notify
+
+	br := dt.SendBatch(ctx, batch)
+	defer br.Close()
+
+	// run QueryRow() on first len(params) number of queries to collect the jobs
+	jobs := make([]Job, 0, len(params))
+	for range params {
+		j, err := scanJob(br.QueryRow())
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrDuplicateJob
+			}
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+
+	// run Exec() for remaining len(queues) number of queries to execute notify
+	for range queues {
+		_, err := br.Exec()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return jobs, nil
+}
+
+// moves a fixed number of jobs from 'available' state to 'running' state and returns them
+func (db *DBStore) Claim(ctx context.Context, p ClaimParams) ([]Job, error) {
+	const query = `
+		UPDATE jobs SET state = 'running', attempts = attempts + 1, locked_by = $1, locked_until = NOW() + ($2 * INTERVAL '1 millisecond')
+		WHERE id IN (
+			SELECT id FROM jobs
+			WHERE queue = $3 AND state = 'available' AND run_at <= NOW()
+			ORDER BY priority ASC, run_at ASC, id ASC
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING
+			id, queue, kind, args, unique_key, priority, attempts, max_attempts,
+			state, run_at, timeout_ms, locked_by, locked_until, errors, created_at, finished_at
+	`
+
+	rows, err := db.pool.Query(ctx, query, p.WorkerID, p.LeaseDuration.Milliseconds(), p.Queue, p.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+// moves a task from 'running' state to 'completed' state
+func (db *DBStore) Complete(ctx context.Context, jobID int64, workerID string) error {
+	const query = `
+		UPDATE jobs SET state = 'completed', finished_at = NOW(), locked_by = null, locked_until = null
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID)
+	if err != nil {
+		return err
+	}
+
+	// if 0 rows were affected, it means the worker lost lease of this job
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// moves a task from 'running' state to 'available' state without consuming an attempt or logging any error
+func (db *DBStore) Snooze(ctx context.Context, jobID int64, workerID string, nextRunAt time.Time) error {
+	const query = `
+		UPDATE jobs SET state = 'available', run_at = $3, attempts = GREATEST(0, attempts - 1), locked_by = null, locked_until = null
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, nextRunAt)
+	if err != nil {
+		return err
+	}
+
+	// if 0 rows were affected, it means the worker lost lease of this job
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// moves a task from 'running' state to 'available' state, consumes an attempt and logs the error
+func (db *DBStore) Retry(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError, nextRunAt time.Time) error {
+	const query = `
+		UPDATE jobs SET state = 'available', run_at = $3, errors = errors || $4::jsonb, locked_by = null, locked_until = null
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	attemptErrVal, err := json.Marshal([]AttemptError{attemptErr})
+	if err != nil {
+		return err
+	}
+
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, nextRunAt, attemptErrVal)
+	if err != nil {
+		return err
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// moves a task from 'running' state to 'dead' state
+func (db *DBStore) DeadLetter(ctx context.Context, jobID int64, workerID string, attemptErr AttemptError) error {
+	const query = `
+		UPDATE jobs SET state = 'dead', finished_at = NOW(), errors = errors || $3::jsonb, locked_by = null, locked_until = null
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	attemptErrVal, err := json.Marshal([]AttemptError{attemptErr})
+	if err != nil {
+		return err
+	}
+
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, attemptErrVal)
+	if err != nil {
+		return err
+	}
+
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// increases the locked_until of a job by leaseDuration ms
+func (db *DBStore) Heartbeat(ctx context.Context, jobID int64, workerID string, leaseDuration time.Duration) error {
+	const query = `
+		UPDATE jobs SET locked_until = NOW() + ($3 * INTERVAL '1 millisecond')
+		WHERE id = $1 AND locked_by = $2 AND state = 'running'
+	`
+	tag, err := db.pool.Exec(ctx, query, jobID, workerID, leaseDuration.Milliseconds())
+	if err != nil {
+		return err
+	}
+
+	// if 0 rows were affected, it means the worker lost lease of this job
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// updates state of jobs in 'running' state whose lease has been lost by their workers
+func (db *DBStore) ReapExpiredLeases(ctx context.Context) (int64, error) {
+	const query = `
+	UPDATE jobs
+	SET state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'available' END,
+		finished_at = CASE WHEN attempts >= max_attempts THEN NOW() ELSE finished_at END,
+		locked_by = NULL,
+		locked_until = NULL,
+		errors = errors || jsonb_build_array(jsonb_build_object(
+			'attempt', attempts,
+			'error', 'worker lease expired',
+			'failed_at', NOW()
+    	))
+	WHERE locked_until < NOW() AND state = 'running'
+	`
+
+	tag, err := db.pool.Exec(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// delete jobs which have been completed before a specified time (olderThan)
+func (db *DBStore) DeleteCompletedJobs(ctx context.Context, olderThan time.Time) (int64, error) {
+	const query = `
+		DELETE FROM jobs
+		WHERE state = 'completed' AND finished_at < $1
+	`
+
+	tag, err := db.pool.Exec(ctx, query, olderThan)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// creates a new schedule; updates if already exists with the same name.
+func (db *DBStore) UpsertSchedule(ctx context.Context, dt DBTX, p UpsertScheduleParams) (Schedule, error) {
+	const query = `
+		INSERT INTO schedules (
+    		name, cron_expr, queue, kind, args, priority, max_attempts,
+    		timeout_ms, misfire_policy, next_run_at, enabled
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (name) DO UPDATE SET
+			cron_expr      = EXCLUDED.cron_expr,
+			queue          = EXCLUDED.queue,
+			kind           = EXCLUDED.kind,
+			args           = EXCLUDED.args,
+			priority       = EXCLUDED.priority,
+			max_attempts   = EXCLUDED.max_attempts,
+			timeout_ms     = EXCLUDED.timeout_ms,
+			misfire_policy = EXCLUDED.misfire_policy,
+			next_run_at    = EXCLUDED.next_run_at,
+			enabled        = EXCLUDED.enabled,
+			updated_at     = NOW()
+		RETURNING
+			name, cron_expr, queue, kind, args, priority, max_attempts,
+			timeout_ms, misfire_policy, next_run_at, last_run_at,
+			enabled, created_at, updated_at
+	`
+
+	row := dt.QueryRow(
+		ctx, query, p.Name, p.CronExpr, p.Queue, p.Kind, p.Args, p.Priority,
+		p.MaxAttempts, p.Timeout.Milliseconds(), p.MisfirePolicy, p.NextRunAt, p.Enabled,
+	)
+
+	s, err := scanSchedule(row)
+
+	if err != nil {
+		return Schedule{}, err
+	}
+
+	return s, nil
+}
+
+// fetches enabled schedules due for a time <= now.
+func (db *DBStore) ListDueSchedules(ctx context.Context, now time.Time, limit int) ([]Schedule, error) {
+	const query = `
+		SELECT name, cron_expr, queue, kind, args, priority, max_attempts, timeout_ms, 
+			misfire_policy, next_run_at, last_run_at, enabled, created_at, updated_at
+		FROM schedules
+		WHERE enabled = TRUE AND next_run_at <= $1
+		ORDER BY next_run_at ASC
+		LIMIT $2
+	`
+
+	rows, err := db.pool.Query(ctx, query, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var schedules []Schedule
+	for rows.Next() {
+		s, err := scanSchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		schedules = append(schedules, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return schedules, nil
+}
+
+func (db *DBStore) AdvanceScheduleAndEnqueue(ctx context.Context, name string, lastRunAt, nextRunAt time.Time, jobs []InsertParams) error {
+	const updateQuery = `
+        UPDATE schedules
+        SET last_run_at = $2, next_run_at = $3, updated_at = NOW()
+        WHERE name = $1 AND enabled = TRUE AND next_run_at <= $2
+    `
+
+	// update schedule and insert jobs within a transaction
+	return pgx.BeginFunc(ctx, db.pool, func(tx pgx.Tx) error {
+		// update schedule
+		tag, err := tx.Exec(ctx, updateQuery, name, lastRunAt, nextRunAt)
+		if err != nil {
+        	return err
+    	}
+		if tag.RowsAffected() == 0 {
+			// Schedule was already advanced by another leader or disabled
+			return nil
+    	}
+		
+		// batch insert jobs
+		if len(jobs) > 0 {
+			if _, err := db.InsertBatch(ctx, tx, jobs); err != nil && !errors.Is(err, ErrDuplicateJob){
+				return err
+			}
+		}
+		return nil
+	})
+}
